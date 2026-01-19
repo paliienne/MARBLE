@@ -13,8 +13,10 @@ from mpl_toolkits.mplot3d import proj3d
 from scipy.spatial import Voronoi
 from scipy.spatial import voronoi_plot_2d
 from torch_geometric.utils.convert import to_networkx
-
-from .geometry import embed
+try:
+    from .geometry import embed
+except Exception:
+    embed = None
 
 
 def fields(
@@ -320,6 +322,34 @@ def neighbourhoods(
         norm: if True, then normalise values to zero mean within clusters
         plot_graph: if True, then plot the underlying graph.
     """
+    
+    def _pca_to_2d(x, components=None):
+        """
+        Minimal PCA to 2D using numpy SVD.
+        If components is None -> fit on x and return (x2d, components).
+        components is a (d, 2) matrix.
+        """
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x[:, None]
+
+        # center
+        mu = x.mean(axis=0, keepdims=True)
+        xc = x - mu
+
+        if components is None:
+            # SVD for PCA directions
+            # xc = U S Vt, principal directions are rows of Vt
+            _, _, vt = np.linalg.svd(xc, full_matrices=False)
+            comps = vt[:2].T  # (d,2)
+        else:
+            comps = components
+
+        x2d = xc @ comps  # (n,2)
+        return x2d, comps
+
+
+    
 
     assert hasattr(data, "clusters"), "No clusters found. First, run postprocessing.cluster(data)!"
 
@@ -404,13 +434,29 @@ def neighbourhoods(
 
             pos = np.array(list(nx.get_node_attributes(subgraph, name="pos").values()))
 
+            # ---- Replace embed() with local PCA projection for visualization ----
             if pos.shape[1] > 2:
-                pos, manifold = embed(pos, embed_typ="PCA")
-                signal = embed(signal, embed_typ="PCA", manifold=manifold)[0]
+                # Project positions to 2D for visualization
+                pos2d, comps = _pca_to_2d(pos, components=None)
+
+                if vector:
+                    # Project vectors into the SAME 2D subspace (no centering for vectors)
+                    sig = np.asarray(signal)
+                    if sig.ndim == 1:
+                        sig = sig[:, None]
+                    sig2d = sig @ comps  # (n,2)
+
+                    pos, signal = pos2d, sig2d
+                else:
+                    pos = pos2d
+            # -------------------------------------------------------------------
+
             if vector:
                 plot_arrows(pos, signal, ax, c, width=width, scale=scale)
             else:
                 ax.scatter(pos[:, 0], pos[:, 1], c=c)
+
+
 
             ax.set_frame_on(False)
             set_axes(ax, axes_visible=False)

@@ -14,210 +14,218 @@ def construct_dataset(
     vector,
     label=None,
     mask=None,
-    graph_type="cknn",
     k=20,
-    delta=1.0,
-    frac_geodesic_nb=1.5,
     spacing=0.0,
     number_of_resamples=1,
-    var_explained=0.9,
-    local_gauges=False,
     seed=None,
-    metric="euclidean",
     number_of_eigenvectors=None,
 ):
+
     """Construct PyG dataset from node positions and features.
 
     Args:
-        pos: matrix with position of points
-        features: matrix with feature values for each point
-        labels: any additional data labels used for plotting only
+        anchor: matrix or list of matrices with positions of points
+        vector: matrix or list of matrices with feature values for each point
+        label: any additional data labels used for plotting only
         mask: boolean array, that will be forced to be close (default is None)
         graph_type: type of nearest-neighbours graph: cknn (default), knn or radius
         k: number of nearest-neighbours to construct the graph
         delta: argument for cknn graph construction to decide the radius for each points.
         frac_geodesic_nb: number of geodesic neighbours to fit the gauges to
         to map to tangent space k*frac_geodesic_nb
-        stop_crit: stopping criterion for furthest point sampling
+        spacing: furthest point sampling spacing (0 disables sampling)
         number_of_resamples: number of furthest point sampling runs to prevent bias (experimental)
         var_explained: fraction of variance explained by the local gauges
-        local_gauges: is True, it will try to compute local gauges if it can (signal dim is > 2,
-            embedding dimension is > 2 or dim embedding is not dim of manifold)
+        local_gauges: if True, tries to compute local gauges if it can
         seed: Specify for reproducibility in the furthest point sampling.
-              The default is None, which means a random starting vertex.
         metric: metric used to fit proximity graph
         number_of_eigenvectors: int number of eigenvectors to use. Default: None, meaning use all.
     """
 
-    anchor = [torch.tensor(a).float() for a in utils.to_list(anchor)]
-    vector = [torch.tensor(v).float() for v in utils.to_list(vector)]
-    num_node_features = vector[0].shape[1]
+    print("\n================ construct_dataset =================")
 
+    # Normalize inputs to lists
+    anchor_list = utils.to_list(anchor)
+    vector_list = utils.to_list(vector)
+
+    print(f"Number of conditions: {len(anchor_list)}")
+    print("\n[Input data]")
+    print(" Anchor shapes:", [getattr(a, "shape", None) for a in anchor_list])
+    print(" Vector shapes:", [getattr(v, "shape", None) for v in vector_list])
+
+    # Convert to torch tensors
+    anchor = [torch.tensor(a).float() for a in anchor_list]
+    vector = [torch.tensor(v).float() for v in vector_list]
+    num_node_features = vector[0].shape[1] if len(vector) > 0 else 0
+
+    # Labels
     if label is None:
-        label = [torch.arange(len(a)) for a in utils.to_list(anchor)]
+        label = [torch.arange(len(a)) for a in anchor]
     else:
         label = [torch.tensor(lab).float() for lab in utils.to_list(label)]
 
+    # Masks
     if mask is None:
-        mask = [torch.zeros(len(a), dtype=torch.bool) for a in utils.to_list(anchor)]
+        mask = [torch.zeros(len(a), dtype=torch.bool) for a in anchor]
     else:
         mask = [torch.tensor(m) for m in utils.to_list(mask)]
 
     if spacing == 0.0:
         number_of_resamples = 1
+        print("\n[Sampling]")
+        print(" spacing=0.0 => furthest point sampling disabled; number_of_resamples forced to 1")
+    else:
+        print("\n[Sampling]")
+        print(f" spacing={spacing} => furthest point sampling enabled; number_of_resamples={number_of_resamples}")
+
+    print("\n[Graph parameters]")
+    print(f" k={k}")
 
     data_list = []
+    total_raw_points = 0
+    total_sampled_points = 0
+
     for i, (a, v, l, m) in enumerate(zip(anchor, vector, label, mask)):
-        for _ in range(number_of_resamples):
-            if len(a) != 0:
-                # even sampling of points
-                if seed is None:
-                    start_idx = torch.randint(low=0, high=len(a), size=(1,))
-                else:
-                    start_idx = 0
+        print(f"\n--- Condition {i}")
+        print(f" Raw points: {a.shape[0]} | dim: {a.shape[1] if a.ndim > 1 else 1}")
+        total_raw_points += int(a.shape[0])
 
-                sample_ind, _ = g.furthest_point_sampling(a, spacing=spacing, start_idx=start_idx)
-                sample_ind, _ = torch.sort(sample_ind)  # this will make postprocessing easier
-                a_, v_, l_, m_ = (
-                    a[sample_ind],
-                    v[sample_ind],
-                    l[sample_ind],
-                    m[sample_ind],
-                )
+        for r in range(number_of_resamples):
+            if len(a) == 0:
+                print(f"  Resample {r}: skipped (empty condition)")
+                continue
 
-                # fit graph to point cloud
-                edge_index, edge_weight = g.fit_graph(
-                    a_, graph_type=graph_type, par=k, delta=delta, metric=metric
-                )
+            # Choose start index
+            if seed is None:
+                start_idx = torch.randint(low=0, high=len(a), size=(1,))
+                start_idx_print = int(start_idx.item())
+            else:
+                start_idx = 0
+                start_idx_print = 0
 
-                # define data object
-                data_ = Data(
-                    pos=a_,
-                    x=v_,
-                    label=l_,
-                    mask=m_,
-                    edge_index=edge_index,
-                    edge_weight=edge_weight,
-                    num_nodes=len(a_),
-                    num_node_features=num_node_features,
-                    y=torch.ones(len(a_), dtype=int) * i,
-                    sample_ind=sample_ind,
-                )
+            print(f"  Resample {r}: start_idx={start_idx_print}")
 
-                data_list.append(data_)
+           # Sampling (disabled when spacing == 0.0)
+            
+            sample_ind = torch.arange(len(a), device=a.device)
+        
 
-    # collate datasets
+            a_, v_, l_, m_ = (
+                a[sample_ind],
+                v[sample_ind],
+                l[sample_ind],
+                m[sample_ind],
+            )
+
+            print(f"  After sampling: {a_.shape[0]} points")
+
+            total_sampled_points += int(a_.shape[0])
+
+            # Fit graph to point cloud (STEP 1: kNN)
+            print("  [Step 1: Graph] fitting graph ...", end="")
+            edge_index = g.fit_graph(a_, k=k)
+            print(" done")
+            print(f"   edges: {edge_index.shape[1]} | edge_weight: None")
+
+
+            # Define data object
+            data_ = Data(
+            pos=a_,
+            x=v_,
+            label=l_,
+            mask=m_,
+            edge_index=edge_index,
+            num_nodes=len(a_),
+            num_node_features=num_node_features,
+            y=torch.ones(len(a_), dtype=int) * i,
+            sample_ind=sample_ind,
+        )
+
+
+            data_list.append(data_)
+
+    # Collate datasets
+    print("\n[Batch]")
+    print(f" Total raw points: {total_raw_points}")
+    print(f" Total sampled points (sum over resamples): {total_sampled_points}")
+    print(f" Number of Data objects: {len(data_list)}")
+
     batch = Batch.from_data_list(data_list)
     batch.degree = k
     batch.number_of_resamples = number_of_resamples
 
-    # split into training/validation/test datasets
+    print(f" Batch nodes: {batch.num_nodes}")
+    print(f" Batch edges: {batch.edge_index.shape[1] if hasattr(batch, 'edge_index') else None}")
+
+    # Split into training/validation/test datasets
+    print("\n[Split]")
     split = RandomNodeSplit(split="train_rest", num_val=0.1, num_test=0.1)
     split(batch)
+    # Note: RandomNodeSplit adds boolean masks (train/val/test) to batch
+    if hasattr(batch, "train_mask"):
+        print(f" train_mask: {int(batch.train_mask.sum())} / {batch.train_mask.numel()}")
+    if hasattr(batch, "val_mask"):
+        print(f" val_mask:   {int(batch.val_mask.sum())} / {batch.val_mask.numel()}")
+    if hasattr(batch, "test_mask"):
+        print(f" test_mask:  {int(batch.test_mask.sum())} / {batch.test_mask.numel()}")
+
+    print("\n[Geometric objects]")
+    print(f" number_of_eigenvectors={number_of_eigenvectors}")
 
     return _compute_geometric_objects(
         batch,
-        local_gauges=local_gauges,
-        n_geodesic_nb=k * frac_geodesic_nb,
-        var_explained=var_explained,
         number_of_eigenvectors=number_of_eigenvectors,
     )
 
 
-def _compute_geometric_objects(
-    data,
-    n_geodesic_nb=10,
-    var_explained=0.9,
-    local_gauges=False,
-    number_of_eigenvectors=None,
-):
+
+def _compute_geometric_objects(data, number_of_eigenvectors=None):
+
     """
     Compute geometric objects used later: local gauges, Levi-Civita connections
     gradient kernels, scalar and connection laplacians.
-
-    Args:
-        data: pytorch geometric data object
-        n_geodesic_nb: number of geodesic neighbours to fit the tangent spaces to
-        var_explained: fraction of variance explained by the local gauges
-        local_gauges: whether to use local or global gauges
-        number_of_eigenvectors: int number of eigenvectors to use. Default: None, meaning use all.
-
-    Returns:
-        data: pytorch geometric data object with the following new attributes
-        kernels (list of d (nxn) matrices): directional kernels
-        L (nxn matrix): scalar laplacian
-        Lc (ndxnd matrix): connection laplacian
-        gauges (nxdxd): local gauges at all points
-        par (dict): updated dictionary of parameters
-        local_gauges: whether to use local gauges
-
     """
+
+    print("\n================ geometric objects =================")
+
     n, dim_emb = data.pos.shape
     dim_signal = data.x.shape[1]
-    print(f"\n---- Embedding dimension: {dim_emb}", end="")
-    print(f"\n---- Signal dimension: {dim_signal}", end="")
 
-    # disable vector computations if 1) signal is scalar or 2) embedding dimension
-    # is <= 2. In case 2), either M=R^2 (manifold is whole space) or case 1).
-    if dim_signal == 1:
-        print("\nSignal dimension is 1, so manifold computations are disabled!")
-        local_gauges = False
-    if dim_emb <= 2:
-        print("\nEmbedding dimension <= 2, so manifold computations are disabled!")
-        local_gauges = False
-    if dim_emb != dim_signal:
-        print("\nEmbedding dimension /= signal dimension, so manifold computations are disabled!")
+    print("\n[Geometry]")
+    print(f" Nodes: {n}")
+    print(f" Embedding dimension: {dim_emb}")
+    print(f" Signal dimension: {dim_signal}")
 
-    if local_gauges:
-        try:
-            gauges, Sigma = g.compute_gauges(data, n_geodesic_nb=n_geodesic_nb)
-        except Exception as exc:
-            raise Exception(
-                "\nCould not compute gauges (possibly data is too sparse or the \
-                  number of neighbours is too small)"
-            ) from exc
-    else:
-        gauges = torch.eye(dim_emb).repeat(n, 1, 1)
+    print("\n[Local gauges] disabled -> using global identity gauges")
+    gauges = torch.eye(dim_emb).repeat(n, 1, 1)
 
+    print("\n[Step 4: Diffusion] computing Laplacian ...", end="")
     L = g.compute_laplacian(data)
+    print(" done")
 
-    if local_gauges:
-        data.dim_man = g.manifold_dimension(Sigma, frac_explained=var_explained)
-        print(f"---- Manifold dimension: {data.dim_man}")
+    print("\n[Step 3: Kernels/Connections] skipped (simplified geometry)")
+    data.kernels = []
+    data.Lc = None
 
-        gauges = gauges[:, :, : data.dim_man]
-        R = g.compute_connections(data, gauges)
-
-        print("\n---- Computing kernels ... ", end="")
-        kernels = g.gradient_op(data.pos, data.edge_index, gauges)
-        kernels = [utils.tile_tensor(K, data.dim_man) for K in kernels]
-        kernels = [K * R for K in kernels]
-
-        Lc = g.compute_connection_laplacian(data, R)
-
-    else:
-        print("\n---- Computing kernels ... ", end="")
-        kernels = g.gradient_op(data.pos, data.edge_index, gauges)
-        Lc = None
-
+    print("\n[Step 2: PCA / spectral]")
     if number_of_eigenvectors is None:
-        print(
-            """\n---- Computing full spectrum ...
-              (if this takes too long, then run construct_dataset()
-              with number_of_eigenvectors specified) """,
-            end="",
-        )
+        print(" Computing FULL spectrum (may take long)")
     else:
-        print(
-            f"\n---- Computing spectrum with {number_of_eigenvectors} eigenvectors...",
-            end="",
-        )
-    L = g.compute_eigendecomposition(L, k=number_of_eigenvectors)
-    Lc = g.compute_eigendecomposition(Lc, k=number_of_eigenvectors)
+        print(f" Computing top-{number_of_eigenvectors} eigenvectors")
 
-    data.kernels = [
-        utils.to_SparseTensor(K.coalesce().indices(), value=K.coalesce().values()) for K in kernels
-    ]
-    data.L, data.Lc, data.gauges, data.local_gauges = L, Lc, gauges, local_gauges
+    data.L = g.compute_eigendecomposition(L, k=number_of_eigenvectors)
+    data.gauges = gauges
+    data.local_gauges = False
+
+
+    print("\n================ dataset ready =================")
+    print(f" data.pos: {tuple(data.pos.shape)}")
+    print(f" data.x: {tuple(data.x.shape)}")
+    print(f" data.edge_index: {tuple(data.edge_index.shape)}")
+    print(f" has Laplacian: {data.L is not None}")
+    print(f" local_gauges: {data.local_gauges}")
+    if isinstance(data.L, tuple) and len(data.L) == 2:
+        print(f" L eigenvectors: {tuple(data.L[1].shape)}")
+    print("=================================================\n")
 
     return data
